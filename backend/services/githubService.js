@@ -315,9 +315,9 @@ function isRateLimited(response) {
   if (response.status === 429) return true;
   if (response.status === 403) {
     // 403 on GitHub is almost always the secondary rate limit. If the quota
-    // header contradicts that, trust the header; if it is absent, fall back to
-    // assuming a limit so the caller degrades to demo data instead of
-    // surfacing a raw 403 to the client.
+    // header contradicts that, trust the header; if it is absent, assume a
+    // limit so the caller reports a clear rate-limit error rather than leaking
+    // a bare 403 to the client.
     const remaining = response.headers.get('x-ratelimit-remaining');
     return remaining === null || remaining === '0';
   }
@@ -473,7 +473,8 @@ export async function searchRepositories(profile) {
         if (!byId.has(raw.id)) byId.set(raw.id, normalizeRepo(raw));
       }
     } else {
-      // A RATE_LIMIT failure is fatal for this request: fall back to demo data.
+      // A RATE_LIMIT failure is fatal: every other search in this batch is
+      // almost certainly limited too, and we refuse to return partial data.
       if (result.reason?.type === 'RATE_LIMIT') {
         console.warn(`[github] ${label} search -> RATE_LIMIT: ${result.reason.message}`);
         throw result.reason;
@@ -494,6 +495,86 @@ export async function searchRepositories(profile) {
 
   if (merged.length > 0) cacheSet(cacheKey, merged);
   console.log(`[github] found ${merged.length} repos${failures.length ? ` (${failures.length} search(es) failed, partial result)` : ''}`);
+
+  return { repos: merged, cached: false, queries };
+}
+
+/**
+ * Second-chance search with relaxed qualifiers.
+ *
+ * The strict query requires a good-first issue, activity within 30 days, a
+ * 50-50k star range and an exact language/topic match. That is the right target
+ * for recommendations, but a narrow profile (e.g. one uncommon skill) can match
+ * literally nothing. Rather than returning an empty deck we widen the search
+ * once: drop the star floor and the topic pins, and allow a 12-month window.
+ *
+ * Repositories found here still have to pass the good-first-issue check in
+ * fetchGoodFirstIssues(), so nothing unusable can reach the client.
+ *
+ * @param {{skills?: string[], interests?: string[], experience?: string}} profile
+ * @returns {Promise<{repos: object[], cached: boolean, queries: string[]}>}
+ */
+export async function searchRepositoriesRelaxed(profile) {
+  const languages = unique(
+    (Array.isArray(profile.skills) ? profile.skills : [])
+      .map((s) => SKILL_TO_LANGUAGE[String(s).toLowerCase().trim()] || null)
+  ).slice(0, 2);
+
+  const since = new Date(Date.now() - 365 * 24 * 3600 * 1000).toISOString().slice(0, 10);
+
+  /** @type {string[]} */
+  const queries = [];
+  if (languages.length > 0) {
+    // Language only: the single most reliable signal, with the windows opened up.
+    queries.push(`language:${languages[0]} good-first-issues:>0 archived:false is:public pushed:>${since} stars:10..50000`);
+  }
+  if (languages.length > 1) {
+    queries.push(`language:${languages[1]} good-first-issues:>0 archived:false is:public pushed:>${since} stars:10..50000`);
+  }
+  // Last resort: any healthy project with beginner-friendly issues.
+  if (queries.length === 0) {
+    queries.push(`good-first-issues:>0 archived:false is:public pushed:>${since} stars:10..50000`);
+  }
+
+  const cacheKey = `relaxed::${queries.join('||')}`;
+  const cached = cacheGet(cacheKey);
+  if (cached) {
+    console.log(`[github] relaxed search cache HIT (${cached.length} repos)`);
+    return { repos: cached, cached: true, queries };
+  }
+
+  console.log(`[github] relaxed retry with ${queries.length} wider query/queries`);
+
+  const settled = await Promise.allSettled(
+    queries.map((q) => {
+      const params = new URLSearchParams({ q, sort: 'updated', order: 'desc', per_page: '10' });
+      return githubFetch(`/search/repositories?${params.toString()}`);
+    })
+  );
+
+  const byId = new Map();
+  settled.forEach((result, index) => {
+    if (result.status === 'fulfilled') {
+      const items = Array.isArray(result.value?.items) ? result.value.items : [];
+      console.log(`[github]   relaxed query ${index + 1} -> ${items.length} repo(s)`);
+      for (const raw of items) {
+        if (!raw || typeof raw.id !== 'number') continue;
+        if (raw.archived || raw.disabled || raw.fork) continue;
+        if (!byId.has(raw.id)) byId.set(raw.id, normalizeRepo(raw));
+      }
+    } else if (result.reason?.type === 'RATE_LIMIT') {
+      throw result.reason;
+    } else {
+      console.warn(`[github]   relaxed query ${index + 1} failed: ${result.reason?.message || result.reason}`);
+    }
+  });
+
+  const merged = [...byId.values()]
+    .sort((a, b) => new Date(b.pushedAt || 0) - new Date(a.pushedAt || 0))
+    .slice(0, MAX_CANDIDATES);
+
+  if (merged.length > 0) cacheSet(cacheKey, merged);
+  console.log(`[github] relaxed search found ${merged.length} repos`);
 
   return { repos: merged, cached: false, queries };
 }

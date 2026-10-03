@@ -20,6 +20,11 @@ import cors from 'cors';
 // non-default value such as GITHUB_TOKEN. See the comment in config.js.
 import { PORT, CORS_ORIGINS, GITHUB_TOKEN, GEMMA_MODEL, OLLAMA_URL, MAX_ANALYZED_REPOS } from './services/config.js';
 import { checkGemma, GEMMA_UNAVAILABLE_MESSAGE } from './services/gemmaService.js';
+import { sendError } from './services/httpError.js';
+import {
+  GITHUB_RATE_LIMIT_MESSAGE,
+  GITHUB_UNAVAILABLE_MESSAGE,
+} from './routes/matchRoutes.js';
 import matchRoutes from './routes/matchRoutes.js';
 
 const app = express();
@@ -105,7 +110,7 @@ app.use('/api', matchRoutes);
 
 // Anything else under /api is a 404, in the standard error envelope.
 app.use('/api', (_req, res) => {
-  res.status(404).json({ error: 'Endpoint not found.', code: 'NOT_FOUND' });
+  sendError(res, 404, 'NOT_FOUND', 'Endpoint not found.');
 });
 
 /* ------------------------------------------------------------------ *
@@ -118,28 +123,32 @@ app.use((err, req, res, _next) => {
 
   if (err?.type === 'GEMMA_UNAVAILABLE') {
     console.error(`[error] GEMMA_UNAVAILABLE on ${req.method} ${req.originalUrl}: ${err.message}`);
-    return res.status(503).json({ error: GEMMA_UNAVAILABLE_MESSAGE, code: 'GEMMA_UNAVAILABLE' });
+    return sendError(res, 503, 'GEMMA_UNAVAILABLE', GEMMA_UNAVAILABLE_MESSAGE);
   }
 
   if (err?.type === 'RATE_LIMIT') {
-    // Should be handled inside the route; if it ever escapes, hide it from the
-    // client exactly like every other GitHub failure.
+    // Handled inside the route; this is a safety net if it ever escapes.
     console.error(`[error] RATE_LIMIT escaped to the error handler: ${err.message}`);
-    return res
-      .status(200)
-      .json({ repositories: [], meta: { dataSource: 'demo', aiSource: 'fallback', cached: false } });
+    return sendError(res, 503, 'GITHUB_RATE_LIMIT', GITHUB_RATE_LIMIT_MESSAGE);
+  }
+
+  if (err?.type === 'NETWORK' || err?.type === 'HTTP') {
+    console.error(`[error] GitHub ${err.type} on ${req.method} ${req.originalUrl}: ${err.message}`);
+    return sendError(res, 503, 'GITHUB_UNAVAILABLE', GITHUB_UNAVAILABLE_MESSAGE);
   }
 
   // express.json() body-parse failure.
   if (err?.type === 'entity.parse.failed') {
-    return res.status(400).json({ error: 'Request body is not valid JSON.', code: 'INVALID_JSON' });
+    return sendError(res, 400, 'INVALID_JSON', 'Request body is not valid JSON.');
   }
 
   console.error(`[error] UNHANDLED on ${req.method} ${req.originalUrl}:`, err);
-  return res.status(500).json({
-    error: 'Something went wrong while building matches. Check the backend logs.',
-    code: 'INTERNAL_ERROR',
-  });
+  return sendError(
+    res,
+    500,
+    'INTERNAL_ERROR',
+    'Something went wrong while building matches. Check the backend logs.'
+  );
 });
 
 /* ------------------------------------------------------------------ *

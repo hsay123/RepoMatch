@@ -1,12 +1,20 @@
 /**
  * matchRoutes.js — the single pipeline endpoint.
  *
- * POST /api/matches
+ * POST /api/matches — LIVE DATA ONLY.
+ *
+ * Every repository and every issue returned comes from the real GitHub API.
+ * There is no sample/demo dataset: if GitHub cannot be reached or is rate
+ * limited, the request fails with an actionable error instead of returning
+ * fabricated repositories.
+ *
  *   validate
  *     -> cache check
- *     -> githubService.searchRepositories      (fallback to demo data on ANY GitHub error)
- *     -> githubService.attachGoodFirstIssues    (top candidates only)
- *     -> matchingService.pickTopCandidates      (deterministic pre-filter, 5 max)
+ *     -> checkGemma                          -> 503 if the model is unavailable
+ *     -> githubService.searchRepositories     (3 parallel calls, merged + deduped)
+ *          -> relaxed retry if the strict query matched nothing
+ *     -> githubService.attachGoodFirstIssues  (top candidates only)
+ *     -> matchingService.pickTopCandidates    (deterministic pre-filter, 5 max)
  *     -> gemmaService.analyzeRepositoriesSequential
  *     -> drop repos with no good-first issues
  *     -> merge + sort by matchScore desc
@@ -16,19 +24,34 @@
 import { Router } from 'express';
 import {
   searchRepositories,
+  searchRepositoriesRelaxed,
   attachGoodFirstIssues,
   clearSearchCache,
 } from '../services/githubService.js';
-import { getDemoRepositories } from '../services/demoData.js';
 import { pickTopCandidates, MATCHING_RUBRIC, MAX_ANALYZED_REPOS } from '../services/matchingService.js';
 import {
   checkGemma,
   analyzeRepositoriesSequential,
   GEMMA_UNAVAILABLE_MESSAGE,
 } from '../services/gemmaService.js';
-import { CACHE_TTL_MS, GITHUB_TOKEN } from '../services/config.js';
+import { CACHE_TTL_MS } from '../services/config.js';
+import { sendError } from '../services/httpError.js';
 
 const router = Router();
+
+/**
+ * RepoMatch serves LIVE data only — there is no demo/sample fallback and no
+ * fabricated repositories.
+ *
+ * When GitHub is unreachable or rate limited we cannot produce real
+ * repositories, so we fail loudly with an actionable message instead of
+ * inventing data. The frontend renders a dedicated "GitHub temporarily limited
+ * repository discovery" state for any error whose code mentions github/rate.
+ */
+export const GITHUB_RATE_LIMIT_MESSAGE =
+  'GitHub rate limit reached while searching for repositories. Add a GITHUB_TOKEN to backend/.env to raise the limit, then try again.';
+export const GITHUB_UNAVAILABLE_MESSAGE =
+  'Could not reach the GitHub API while searching for repositories. Check your internet connection, then try again.';
 
 /* ------------------------------------------------------------------ *
  * Final-response cache (10 min TTL)
@@ -160,7 +183,7 @@ router.post('/matches', async (req, res, next) => {
   const validation = validateProfile(req.body);
   if (!validation.ok) {
     console.warn(`[matches] 400 INVALID_PROFILE — ${validation.message}`);
-    return res.status(400).json({ error: validation.message, code: 'INVALID_PROFILE' });
+    return sendError(res, 400, 'INVALID_PROFILE', validation.message);
   }
   const profile = validation.profile;
 
@@ -183,11 +206,12 @@ router.post('/matches', async (req, res, next) => {
     const health = await checkGemma();
     if (!health.ollama || !health.gemma) {
       console.warn(`[matches] 503 GEMMA_UNAVAILABLE — ollama=${health.ollama} gemma=${health.gemma}`);
-      return res.status(503).json({ error: GEMMA_UNAVAILABLE_MESSAGE, code: 'GEMMA_UNAVAILABLE' });
+      return sendError(res, 503, 'GEMMA_UNAVAILABLE', GEMMA_UNAVAILABLE_MESSAGE);
     }
 
-    /* 4. repositories: GitHub, falling back to demo data -------------- */
-    let dataSource = 'github';
+    /* 4. repositories: live GitHub, no fabricated data ---------------- */
+    // RepoMatch only ever returns real repositories. If GitHub cannot be
+    // reached we surface that as an error instead of substituting samples.
     let repos = [];
     let searchCacheHit = false;
 
@@ -196,43 +220,53 @@ router.post('/matches', async (req, res, next) => {
       repos = search.repos;
       searchCacheHit = search.cached;
       if (repos.length === 0) {
-        console.warn('[github] 0 repos returned, falling back to demo data');
-        repos = getDemoRepositories();
-        dataSource = 'demo';
+        // A successful search that matched nothing is not an error, but the
+        // qualifiers were too strict to be useful, so widen the net and retry
+        // once before giving up.
+        console.warn('[github] 0 repos matched the strict query — retrying with relaxed qualifiers');
+        const relaxed = await searchRepositoriesRelaxed(profile);
+        repos = relaxed.repos;
+        searchCacheHit = relaxed.cached;
       }
     } catch (err) {
-      // RATE_LIMIT, NETWORK, HTTP — all of them are invisible to the client.
-      console.warn(`[github] search failed (${err?.type || 'UNKNOWN'}): ${err?.message || err} — using demo data`);
-      repos = getDemoRepositories();
-      dataSource = 'demo';
+      const rateLimited = err?.type === 'RATE_LIMIT';
+      console.warn(
+        `[matches] GitHub search failed (${err?.type || 'UNKNOWN'}): ${err?.message || err}`
+      );
+      return sendError(
+        res,
+        503,
+        rateLimited ? 'GITHUB_RATE_LIMIT' : 'GITHUB_UNAVAILABLE',
+        rateLimited ? GITHUB_RATE_LIMIT_MESSAGE : GITHUB_UNAVAILABLE_MESSAGE
+      );
     }
 
     /* 5. good-first issues for the strongest candidates -------------- */
     // The pre-filter needs issue counts, so we do a cheap first pass, fetch
     // issues for the top slice, then re-rank with the real data.
-    if (dataSource === 'github') {
-      const preRanked = pickTopCandidates(repos, profile, MAX_ANALYZED_REPOS * 2);
-      try {
-        await attachGoodFirstIssues(preRanked);
-      } catch (err) {
-        if (err?.type === 'RATE_LIMIT') {
-          console.warn(`[github] ${err.message} during issue fetch — using demo data`);
-          repos = getDemoRepositories();
-          dataSource = 'demo';
-        } else {
-          throw err;
-        }
-      }
-      if (dataSource === 'github') {
-        // pickTopCandidates returns shallow copies, and attachGoodFirstIssues
-        // mutates those copies. Swap each enriched copy back into the pool so
-        // the issue lists survive; the original objects are discarded.
-        const enrichedById = new Map(preRanked.map((r) => [r.id, r]));
-        repos = repos.map((r) => enrichedById.get(r.id) || r);
-      }
+    const preRanked = pickTopCandidates(repos, profile, MAX_ANALYZED_REPOS * 2);
+    try {
+      await attachGoodFirstIssues(preRanked);
+    } catch (err) {
+      // A rate limit here means we cannot know which repos have real issues,
+      // so we must not return half-verified results.
+      const rateLimited = err?.type === 'RATE_LIMIT';
+      console.warn(`[matches] issue fetch failed (${err?.type || 'UNKNOWN'}): ${err?.message || err}`);
+      return sendError(
+        res,
+        503,
+        rateLimited ? 'GITHUB_RATE_LIMIT' : 'GITHUB_UNAVAILABLE',
+        rateLimited ? GITHUB_RATE_LIMIT_MESSAGE : GITHUB_UNAVAILABLE_MESSAGE
+      );
     }
 
-    console.log(`[matches] dataSource=${dataSource}, candidate pool=${repos.length}`);
+    // pickTopCandidates returns shallow copies, and attachGoodFirstIssues
+    // mutates those copies. Swap each enriched copy back into the pool so
+    // the issue lists survive; the original objects are discarded.
+    const enrichedById = new Map(preRanked.map((r) => [r.id, r]));
+    repos = repos.map((r) => enrichedById.get(r.id) || r);
+
+    console.log(`[matches] live GitHub candidate pool=${repos.length}`);
 
     /* 6. deterministic pre-filter -> top 5 --------------------------- */
     const topCandidates = pickTopCandidates(repos, profile, MAX_ANALYZED_REPOS).filter(
@@ -245,17 +279,18 @@ router.post('/matches', async (req, res, next) => {
     );
 
     if (topCandidates.length === 0) {
-      // Nothing to analyse. Return a well-formed empty result rather than 500,
-      // and point the frontend at demo data if GitHub was the source.
-      console.warn('[matches] no candidate has a good-first issue — returning empty result');
+      // A real search that legitimately produced nothing we can recommend is
+      // not an error — an empty deck is an honest answer and the frontend has
+      // an empty state for it.
+      console.warn('[matches] no candidate had an open good-first issue — returning an empty deck');
       return res.status(200).json({
         repositories: [],
-        meta: { dataSource, aiSource: 'fallback', cached: false },
+        meta: { dataSource: 'github', aiSource: 'gemma', cached: false },
       });
     }
 
     /* 7. Gemma analysis, strictly sequential -------------------------- */
-    const { results, anyFallback, anyGemma } = await analyzeRepositoriesSequential(profile, topCandidates);
+    const { results, anyGemma } = await analyzeRepositoriesSequential(profile, topCandidates);
 
     /* 8. drop repos with no issues + merge + sort ---------------------- */
     const repositories = topCandidates
@@ -270,35 +305,28 @@ router.post('/matches', async (req, res, next) => {
       .filter(Boolean)
       .sort((a, b) => b.matchScore - a.matchScore);
 
-    const aiSource = anyGemma ? 'gemma' : 'fallback';
+    // dataSource is always "github": every repository here is real, fetched
+    // live from the GitHub API. aiSource is "fallback" only when Ollama was up
+    // but an individual call failed, in which case the scoring is
+    // deterministic rather than model-generated — the repository data itself
+    // is still real and comes straight from GitHub.
     const payload = {
       repositories,
       meta: {
-        dataSource,
-        aiSource: anyFallback && anyGemma ? 'gemma' : aiSource,
+        dataSource: 'github',
+        aiSource: anyGemma ? 'gemma' : 'fallback',
         cached: false,
       },
     };
 
     console.log(
-      `[matches] responding with ${repositories.length} repos (dataSource=${dataSource}, aiSource=${payload.meta.aiSource}) ` +
+      `[matches] responding with ${repositories.length} live repos (aiSource=${payload.meta.aiSource}) ` +
         `in ${((Date.now() - requestStarted) / 1000).toFixed(1)}s`
     );
     if (searchCacheHit) console.log('[matches] note: GitHub search results came from the 10-minute cache');
 
     /* 9. cache the final response ------------------------------------- */
-    // A degraded result (demo data + deterministic scoring, i.e. no live GitHub
-    // and no live model) is deliberately NOT cached. It means GitHub was rate
-    // limited, and that usually clears within minutes — the next request for
-    // the same profile should get the real thing instead of being stuck with a
-    // cached placeholder for 10 minutes. Everything else caches for the full
-    // TTL.
-    const degraded = payload.meta.dataSource === 'demo' && payload.meta.aiSource === 'fallback';
-    if (degraded) {
-      console.log('[cache] skipping cache for a degraded (demo + fallback) result so the next call retries live sources');
-    } else {
-      writeCache(cacheKey, payload);
-    }
+    writeCache(cacheKey, payload);
 
     return res.status(200).json(payload);
   } catch (err) {
@@ -307,4 +335,4 @@ router.post('/matches', async (req, res, next) => {
 });
 
 export default router;
-export { cacheKeyFor, validateProfile };
+export { cacheKeyFor, validateProfile, toClientRepository };

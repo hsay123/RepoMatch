@@ -6,11 +6,9 @@ import SwipeDeck from './components/SwipeDeck'
 import MatchResult from './components/MatchResult'
 import Loading from './components/Loading'
 import { checkBackendHealth, findMatches } from './services/api'
-import { mockRepositories } from './services/mockData'
 import './App.css'
 
 const emptyProfile = { skills: [], interests: [], experience: '', contributionTypes: [] }
-const isMockMode = import.meta.env.VITE_USE_MOCK_DATA === 'true'
 
 function App() {
   const [screen, setScreen] = useState('landing')
@@ -44,9 +42,7 @@ function App() {
     setError(null)
     setScreen('loading')
     try {
-      const data = isMockMode
-        ? await new Promise((resolve) => setTimeout(() => resolve({ repositories: mockRepositories }), 1250))
-        : await findMatches(nextProfile)
+      const data = await findMatches(nextProfile)
       const nextRepositories = Array.isArray(data?.repositories) ? data.repositories : []
       setRepositories(nextRepositories)
       setCurrentIndex(0)

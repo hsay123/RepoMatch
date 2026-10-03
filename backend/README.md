@@ -6,7 +6,9 @@ model** (via Ollama) to score each one and pick the single best starter issue.
 
 - JavaScript (ES modules), Node 18+, Express
 - No database, no auth, no cloud LLM APIs — everything AI runs on your laptop
-- Works with or without a GitHub token (falls back to demo data when rate limited)
+- **Live data only.** Every repository and issue comes from the real GitHub API.
+  There is no sample dataset; if GitHub is unreachable the API returns a clear
+  error rather than fabricated repositories.
 
 ---
 
@@ -50,7 +52,7 @@ backend/
 │   ├── githubService.js   GitHub REST: search, issues, normalisation, TTL cache
 │   ├── gemmaService.js    Ollama: health, prompts, JSON parsing, validation
 │   ├── matchingService.js deterministic pre-filter (0-100 rubric)
-│   └── demoData.js        8 offline repos used when GitHub fails
+│   └── httpError.js       one shared error envelope for every failure
 ├── routes/
 │   └── matchRoutes.js     POST /api/matches pipeline + response cache
 ├── server.js              app wiring, CORS, health route, error handler
@@ -121,7 +123,7 @@ curl -X POST http://localhost:3000/api/matches \
     }
   ],
   "meta": {
-    "dataSource": "github",                   // "github" | "demo"
+    "dataSource": "github",                   // always "github" — live data only
     "aiSource": "gemma",                      // "gemma" | "fallback"
     "cached": false                           // true on a repeat within 10 min
   }
@@ -135,7 +137,10 @@ with the same profile return in ~1 ms from the cache, and `meta.cached` is `true
 
 ### Errors
 
-Always `{"error": string, "code": string}`:
+Always `{"error": string, "code": string, "message": string}` — all three carry
+the same text. `message` is included because the React frontend reads
+`data.message` when rendering a failure; `error` and `code` are the documented
+contract.
 
 | Status | Code | When |
 | --- | --- | --- |
@@ -143,11 +148,13 @@ Always `{"error": string, "code": string}`:
 | 400 | `INVALID_JSON` | body is not parseable JSON |
 | 404 | `NOT_FOUND` | unknown `/api/*` path |
 | 503 | `GEMMA_UNAVAILABLE` | Ollama down or `gemma4:e2b` not installed |
+| 503 | `GITHUB_RATE_LIMIT` | GitHub search/issue quota exhausted |
+| 503 | `GITHUB_UNAVAILABLE` | GitHub unreachable or returned an error |
 | 500 | `INTERNAL_ERROR` | anything unexpected |
 
-`429 GITHUB_RATE_LIMIT` is **never** returned to the client. On any GitHub
-failure or rate limit the server silently switches to `demoData.js` and sets
-`meta.dataSource = "demo"`.
+`429` is never returned. GitHub failures surface as `503` with a
+`GITHUB_*` code, which the frontend already renders as "GitHub temporarily
+limited repository discovery". No fabricated repositories are ever substituted.
 
 ### `DELETE /api/cache` (dev convenience)
 
@@ -166,13 +173,20 @@ validate
   -> cache lookup (10 min, keyed by normalised profile)
   -> checkGemma()                     -> 503 if unavailable (fails in ~100 ms)
   -> searchRepositories()             3 parallel /search calls, merged + deduped, ~15 repos
-  -> attachGoodFirstIssues()          top 8 candidates, 3 at a time
+       -> searchRepositoriesRelaxed() retry with wider qualifiers if 0 matched
+  -> attachGoodFirstIssues()          top 10 candidates, 3 at a time
+       -> 503 GITHUB_* on failure (never returns unverifiable repos)
   -> pickTopCandidates()              deterministic pre-filter, top 5
   -> analyzeRepositoriesSequential()  one /api/chat call at a time
   -> drop repos with zero good-first issues
   -> merge into the client shape, sort by matchScore desc
   -> cache for 10 min, respond
 ```
+
+The relaxed retry exists because a narrow profile can legitimately match
+nothing: it drops the star floor and topic pins and widens the activity window
+to 12 months, but still requires `good-first-issues:>0`, so anything found is
+still a real recommendable repository.
 
 ### Why the search query has only one topic
 
@@ -224,15 +238,23 @@ repo summary, and a numbered issue list, then asks for exactly:
 
 Model reasoning is never read and never returned.
 
-### Fallback behaviour
+### Degradation behaviour
+
+Every repository in a response is real, live GitHub data — that is never
+compromised. Only the *scoring* can degrade, and only when Ollama is up but an
+individual call misbehaves.
 
 | Situation | Result |
 | --- | --- |
-| Ollama down / model missing | `503 GEMMA_UNAVAILABLE` (never silently degraded) |
-| One call times out (90 s) | deterministic result, `aiSource: "fallback"` |
-| Malformed JSON | deterministic result, `aiSource: "fallback"` |
-| Hallucinated issue number | corrected to a real issue |
-| GitHub 403/429/network | demo data, `dataSource: "demo"` |
+| Ollama down / model missing | `503 GEMMA_UNAVAILABLE` — never silently degraded |
+| One Gemma call times out (90 s) | real repo, deterministic score, `aiSource: "fallback"` |
+| Malformed model JSON | real repo, deterministic score, `aiSource: "fallback"` |
+| Hallucinated issue number | corrected to a real issue from GitHub |
+| GitHub 403/429 | `503 GITHUB_RATE_LIMIT` — no repositories returned |
+| GitHub unreachable / 5xx | `503 GITHUB_UNAVAILABLE` — no repositories returned |
+
+The last two are the important ones: rather than inventing results, the API
+fails with a message the frontend can act on.
 
 ---
 
@@ -283,12 +305,20 @@ To go faster during development, lower `MAX_ANALYZED_REPOS` in
 `services/config.js` to `3`, or set `OLLAMA_KEEP_ALIVE` so the model stays
 resident between calls.
 
-**`meta.dataSource` is `"demo"`**
-GitHub failed — almost always the anonymous rate limit (10 searches/min,
-60 requests/hour total). Create a token at
-<https://github.com/settings/tokens> (public repo read is enough) and put it in
-`.env` as `GITHUB_TOKEN=ghp_…`, then restart. `DELETE /api/cache` after
-changing it.
+**`503 GITHUB_RATE_LIMIT` — "Add a GITHUB_TOKEN"**
+This is the most common real-world failure. Anonymous GitHub access allows only
+10 search requests/minute and 60 requests/hour total, and `/api/matches` needs
+about 13. Create a token at <https://github.com/settings/tokens> (public repo
+read is enough), put it in `.env` as `GITHUB_TOKEN=ghp_…`, restart, then
+`DELETE /api/cache`.
+
+With a token you get 5000 requests/hour and 30 searches/minute, which is
+comfortable. Confirm it took effect via the startup banner (`GITHUB_TOKEN : set`).
+
+**`503 GITHUB_UNAVAILABLE`**
+GitHub could not be reached at all — usually no internet connection, a proxy,
+or a corporate firewall blocking `api.github.com`. RepoMatch deliberately returns
+an error here instead of sample data.
 
 **`EADDRINUSE: port 3000 already in use`**
 ```bash
