@@ -1,16 +1,15 @@
 # RepoMatch frontend
 
-React + Vite JavaScript frontend for discovering open-source projects and their recommended first contribution. This repository contains no backend, GitHub API integration, or Ollama integration.
+React + Vite JavaScript frontend for discovering open-source projects and their recommended first contribution. The frontend communicates with the separate backend in `backend/`; GitHub and Ollama calls stay on the backend.
 
 ## Run locally
 
 ```sh
-cd frontend
 npm install
 npm run dev
 ```
 
-Vite serves the app at `http://localhost:5173` (the port is fixed). The matching backend is expected at `http://localhost:3000`.
+Run these commands from the repository root. Vite serves the app at `http://localhost:5173` (the port is fixed). The matching backend is expected at `http://localhost:3000`.
 
 ## Backend contract
 
@@ -23,9 +22,17 @@ The matches response is `{ "repositories": [...] }`. Each repository may provide
 
 The backend should allow browser requests from `http://localhost:5173` (CORS). Set `VITE_API_URL` to override the default backend origin.
 
-## Demo mode
+## Deploy the frontend on Vercel
 
-Copy `.env.example` to `.env.local`, set `VITE_USE_MOCK_DATA=true`, and start Vite. The UI then uses five realistic repositories in `src/services/mockData.js`, without silently replacing real-backend errors. Remove or set the flag to `false` to use the backend. Mock mode can be tested without a running backend; the health badge remains offline unless `/api/health` explicitly reports Gemma availability.
+1. Import `hsay123/RepoMatch` into Vercel.
+2. Set the project root directory to `.`. The Vite `package.json` is at the repository root.
+3. Use the Vite framework preset, build command `npm run build`, and output directory `dist`. Vercel can install dependencies with `npm install`.
+4. Add `VITE_API_URL` in the Vercel project environment variables. Set it to the public backend origin, for example `https://api.example.com`, without a trailing slash or `/api` path. Apply it to Production and Preview as needed, then redeploy.
+5. On the backend host, set `CORS_ORIGINS` to the exact Vercel site origin, such as `https://your-project.vercel.app`. Add any custom domain there too. Multiple origins are comma-separated; preview deployments may need their exact origins added because the backend checks for exact matches.
+
+Vercel deploys only the frontend. Matching works only when the backend is reachable over the internet. The backend also needs access to Ollama/Gemma; its default `OLLAMA_URL=http://localhost:11434` refers to the backend host itself, not a visitor's computer. Keep `GITHUB_TOKEN` and other secrets on the backend, never in Vercel `VITE_*` variables.
+
+For local development, `.env.example` points `VITE_API_URL` at `http://localhost:3000`; copy it to `.env.local` if you need to override the default.
 
 ## Verify
 

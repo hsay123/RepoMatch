@@ -13,7 +13,7 @@ function Navbar({ activeScreen, gemmaConnected, onNavigate }) {
       </nav>
       <div className={`ai-status ${gemmaConnected ? 'connected' : 'offline'}`} aria-live="polite">
         <span className="status-led" />
-        <span><b>{gemmaConnected ? 'LOCAL GEMMA · CONNECTED' : 'LOCAL GEMMA · OFFLINE'}</b><small><Sparkles size={11} /> Gemma 4 E2B · {gemmaConnected ? 'running locally' : 'connection unverified'}</small></span>
+       
       </div>
     </header>
   )
