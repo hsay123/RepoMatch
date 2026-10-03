@@ -1,0 +1,11 @@
+# Keep the local Node backend out of the Vercel deployment.
+#
+# RepoMatch's AI runs on Ollama inside this machine, which Vercel's serverless
+# functions cannot reach. The backend therefore stays local and is published
+# through an ngrok tunnel; Vercel only ever serves the static React build.
+backend/
+node_modules/
+dist/
+.env
+.env.local
+backend/.env
